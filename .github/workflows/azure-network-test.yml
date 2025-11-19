@@ -1,0 +1,78 @@
+name: Azure Network Connection Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_endpoint:
+        description: 'Private endpoint to test (optional)'
+        required: false
+        default: 'none'
+
+jobs:
+  test-network-connection:
+    name: Test Azure VNet Connection
+    runs-on: ubuntu-latest
+
+    # Use Azure Virtual Network configuration
+    network:
+      configuration: qenex-github-actions-network
+
+    steps:
+      - name: Check runner IP address
+        run: |
+          echo "🌐 Checking runner public IP address..."
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "Runner IP: $RUNNER_IP"
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+
+      - name: Test Azure Management API
+        run: |
+          echo "🔍 Testing connection to Azure Management API..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://management.azure.com)
+          echo "Response code: $HTTP_CODE"
+          if [ "$HTTP_CODE" -eq 401 ] || [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Successfully reached Azure Management API"
+          else
+            echo "⚠️ Unexpected response code: $HTTP_CODE"
+          fi
+
+      - name: Test GitHub API connectivity
+        run: |
+          echo "🔍 Testing connection to GitHub API..."
+          curl -s https://api.github.com | head -5
+          echo "✅ GitHub API accessible"
+
+      - name: Test DNS resolution
+        run: |
+          echo "🔍 Testing DNS resolution..."
+          nslookup github.com
+          nslookup management.azure.com
+          echo "✅ DNS working correctly"
+
+      - name: Network diagnostics
+        run: |
+          echo "📊 Network Diagnostics:"
+          echo "-------------------"
+          echo "Hostname: $(hostname)"
+          echo "Network interfaces:"
+          ip addr show | grep -E "inet |link"
+          echo ""
+          echo "Default routes:"
+          ip route show
+
+      - name: Test custom endpoint
+        if: inputs.test_endpoint != 'none'
+        run: |
+          echo "🔍 Testing custom endpoint: ${{ inputs.test_endpoint }}"
+          curl -v -m 10 ${{ inputs.test_endpoint }} || echo "⚠️ Could not reach endpoint"
+
+      - name: Summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Azure Network Connection Test Complete"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Runner IP: $RUNNER_IP"
+          echo "Network Config: qenex-github-actions-network"
+          echo "VNet: germany-vnet"
+          echo "Subnet: github-actions-subnet"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
