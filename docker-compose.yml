@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  database:
+    image: postgres:15-alpine
+    container_name: registry-db
+    environment:
+      POSTGRES_DB: registry
+      POSTGRES_USER: registry_user
+      POSTGRES_PASSWORD: secure_password_change_in_production
+    volumes:
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - registry-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry_user -d registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # EPP Server (Port 700)
+  epp-server:
+    build:
+      context: ./epp-server
+      dockerfile: Dockerfile
+    container_name: registry-epp
+    environment:
+      EPP_DB_HOST: database
+      EPP_DB_NAME: registry
+      EPP_DB_USER: registry_user
+      EPP_DB_PASSWORD: secure_password_change_in_production
+      EPP_PORT: 700
+      EPP_TLS_ENABLED: "true"
+    ports:
+      - "700:700"
+    depends_on:
+      database:
+        condition: service_healthy
+    volumes:
+      - ./certs:/certs:ro
+      - ./config:/config:ro
+    restart: unless-stopped
+
+  # RDAP Server (Port 8080)
+  rdap-server:
+    build:
+      context: ./rdap-server
+      dockerfile: Dockerfile
+    container_name: registry-rdap
+    environment:
+      EPP_DB_HOST: database
+      EPP_DB_NAME: registry
+      EPP_DB_USER: registry_user
+      EPP_DB_PASSWORD: secure_password_change_in_production
+      RDAP_PORT: 8080
+      RDAP_BASE_URL: https://registry.example.com
+    ports:
+      - "8080:8080"
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # WHOIS Server (Port 43)
+  whois-server:
+    build:
+      context: ./whois-server
+      dockerfile: Dockerfile
+    container_name: registry-whois
+    environment:
+      EPP_DB_HOST: database
+      EPP_DB_NAME: registry
+      EPP_DB_USER: registry_user
+      EPP_DB_PASSWORD: secure_password_change_in_production
+      WHOIS_PORT: 43
+    ports:
+      - "43:43"
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Admin Dashboard (Port 8081)
+  admin-dashboard:
+    build:
+      context: ./admin-dashboard
+      dockerfile: Dockerfile
+    container_name: registry-admin
+    environment:
+      EPP_DB_HOST: database
+      EPP_DB_NAME: registry
+      EPP_DB_USER: registry_user
+      EPP_DB_PASSWORD: secure_password_change_in_production
+      DASHBOARD_PORT: 8081
+      SECRET_KEY: change_this_secret_key_in_production
+    ports:
+      - "8081:8081"
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  registry-data:
+    driver: local
+
+networks:
+  default:
+    name: registry-network
