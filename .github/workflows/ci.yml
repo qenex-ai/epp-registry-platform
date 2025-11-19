@@ -1,0 +1,251 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  PYTHON_VERSION: '3.11'
+  POSTGRES_VERSION: '15'
+
+jobs:
+  lint:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort mypy pylint
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Black (Code Formatting)
+        run: black --check src/
+
+      - name: Run isort (Import Sorting)
+        run: isort --check-only src/
+
+      - name: Run Flake8 (Linting)
+        run: flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Pylint (Advanced Linting)
+        continue-on-error: true
+        run: pylint src/ --disable=C,R --exit-zero
+
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: registry_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pytest-asyncio
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Initialize test database
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGDATABASE: registry_test
+          PGUSER: test_user
+          PGPASSWORD: test_password
+        run: |
+          psql -f schema.sql
+
+      - name: Run tests with coverage
+        env:
+          EPP_DB_HOST: localhost
+          EPP_DB_NAME: registry_test
+          EPP_DB_USER: test_user
+          EPP_DB_PASSWORD: test_password
+        run: |
+          pytest src/ -v --cov=src --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  docker-build:
+    name: Docker Build & Validate
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+
+    strategy:
+      matrix:
+        service: [epp-server, rdap-server, whois-server, admin-dashboard]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service }}
+          push: false
+          tags: qenex/epp-registry-${{ matrix.service }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          docker run --rm qenex/epp-registry-${{ matrix.service }}:test --version || true
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Bandit security linter
+        run: |
+          pip install bandit
+          bandit -r src/ -f json -o bandit-report.json || true
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
+  integration-test:
+    name: Integration Tests (Docker Compose)
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start services with Docker Compose
+        run: |
+          docker-compose up -d
+          sleep 30  # Wait for services to be ready
+
+      - name: Test EPP Server connectivity
+        run: |
+          timeout 5 bash -c 'cat < /dev/null > /dev/tcp/localhost/700' || exit 1
+
+      - name: Test RDAP API
+        run: |
+          curl -f http://localhost:8080/rdap/ || exit 1
+
+      - name: Test WHOIS Server
+        run: |
+          echo "example.com" | nc localhost 43 || exit 1
+
+      - name: Test Admin Dashboard
+        run: |
+          curl -f http://localhost:8081/ || exit 1
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          docker-compose logs
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker-compose down -v
+
+  validate-kubernetes:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kubernetes tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Validate Kubernetes YAML
+        run: |
+          if [ -d "kubernetes" ]; then
+            kubectl apply --dry-run=client -f kubernetes/
+          fi
+
+      - name: Run kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          if [ -d "kubernetes" ]; then
+            ./kubeval kubernetes/*.yaml
+          fi
+
+  notify:
+    name: Notification
+    runs-on: ubuntu-latest
+    needs: [lint, test, docker-build, security-scan, integration-test, validate-kubernetes]
+    if: always()
+
+    steps:
+      - name: Check job status
+        run: |
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Test: ${{ needs.test.result }}"
+          echo "Docker Build: ${{ needs.docker-build.result }}"
+          echo "Security Scan: ${{ needs.security-scan.result }}"
+          echo "Integration Test: ${{ needs.integration-test.result }}"
+          echo "Kubernetes Validation: ${{ needs.validate-kubernetes.result }}"
